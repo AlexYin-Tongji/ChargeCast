@@ -1,241 +1,267 @@
 ﻿# ChargeCast
 
-ChargeCast 是一个“交通流预测 + 充电功率预测”的两阶段项目：
+ChargeCast 是一个“交通流预测 + 充电负荷预测”的端到端工程，分为两段：
 
-- 第一部分：基于拓扑图的交通流预测（区分外生/内生节点）
-- 第二部分：基于流量预测结果构建充电数据集，并进行站点级充电建模
-- 最终评估：端到端预测总充电功率（MAE/RMSE）
+1. `flow` 阶段：基于路网拓扑做多节点交通流预测（外生/内生节点解耦建模）
+2. `charge` 阶段：结合流量与充电数据，做站点级比率/功率建模，并评估总充电功率
 
-> 说明：仓库中的数据为示例数据，主要用于验证代码链路与数据结构。
+项目默认提供示例数据，用于验证代码链路与字段结构；真实业务数据可直接按同样格式替换。
 
-## 1. 项目结构
+## 一、项目全景
+
+### 1) 方法流程
+
+```text
+flow train/test + adj
+    └─(节点对齐 adj ∩ train ∩ test)
+        └─ 两阶段流量训练
+           ├─ Stage-1: 外生节点单点 LSTM
+           └─ Stage-2: 内生节点传播/分配 + 冻结外生模型
+                └─ 得到 gate flow 预测
+                    └─ 充电数据集构建（ratio / avg_power）
+                        └─ 站点级 Beta + LogNormal 训练
+                            └─ 端到端总功率评估 (MAE / RMSE)
+```
+
+### 2) 目录结构
 
 ```text
 .
-├─ flowConfig/                 # 全局配置
-│  └─ config.py
+├─ flowConfig/
+│  └─ config.py                         # 全局配置
 ├─ src/
-│  ├─ data/                    # 数据加载、节点对齐
-│  └─ models/                  # 核心模型（LSTM / 分配 / 传播 / 主模型）
-├─ flowScripts/                # 交通流训练/测试/推理/可视化
-├─ flowEvaluation/             # 内生节点递归多步评估与可视化
-├─ chargePrediction/           # 充电预测数据准备、训练、测试、可视化
+│  ├─ data/
+│  │  ├─ flow_data.py                   # 流量数据读取与序列构造
+│  │  └─ alignment.py                   # canonical 节点对齐
+│  └─ models/
+│     ├─ flow_predictor.py              # 核心主模型
+│     ├─ lstm.py                        # 外生节点 LSTM
+│     ├─ allocation.py                  # 分配模块
+│     ├─ propagation.py                 # 传播模块
+│     └─ topology.py                    # 拓扑处理
+├─ flowScripts/
+│  ├─ train.py                          # 两阶段训练入口
+│  ├─ test.py                           # 单步测试
+│  ├─ visualize.py                      # 预测可视化
+│  ├─ predict.py                        # 推理工具函数
+│  ├─ recursive_test.py                 # 旧版递归测试脚本（可选）
+│  └─ lstm_baseline.py                  # 基线脚本（可选）
+├─ flowEvaluation/
+│  ├─ multi_step_evaluate.py            # 内生递归多步评估
+│  └─ visualize_endogenous.py           # 内生递归可视化
+├─ chargePrediction/
+│  ├─ prepare_charge_data.py            # charge 节点对齐过滤（可原地覆盖）
+│  ├─ prepare_charge_dataset.py         # 构建 charge 训练/测试文件
+│  ├─ train_station_models.py           # 站点级模型训练
+│  ├─ test_station_models.py            # 端到端总功率评估
+│  └─ visualize_total_power.py          # 端到端可视化
 ├─ data/
-│  ├─ flow/                    # 交通流数据（adj/train/test）
-│  └─ charge/                  # 充电数据（charge/train/test）
-└─ models/                     # 流量模型 checkpoint（默认 best_model.pt）
+│  ├─ flow/                             # flow 数据 (adj/train/test)
+│  └─ charge/                           # charge 数据 (charge/train/test)
+└─ models/
+   └─ best_model.pt                     # flow 阶段 Stage-2 默认 checkpoint
 ```
 
-## 2. 交通流模型（Flow）
+## 二、环境准备
 
-### 2.1 核心思路
+### 1) Python 与依赖
 
-1. 节点对齐：统一节点集合为 `adj ∩ train ∩ test`（canonical nodes）
-2. 拓扑划分：
-   - 外生节点（无上游）
-   - 内生节点（有上游）
-3. 两阶段训练：
-   - Stage-1：每个外生节点单独 LSTM 训练并保存
-   - Stage-2：加载并冻结外生模型，训练内生传播与分配模块
-4. 前向预测：
-   - 外生节点在多步预测中按滚动历史逐步重算
-   - 分配权重在同一上游节点的出边上做归一化
-
-### 2.2 关键模块
-
-- `src/models/flow_predictor.py`
-  - 外生：`MultiNodeLSTMPredictor`
-  - 分配：`FourierAllocation`
-  - 传播：`BayesianPropagation`
-  - 支持内生高斯补偿（`ENDOGENOUS_GAUSSIAN`）
-- `src/data/alignment.py`
-  - canonical 节点构建与对齐
-- `src/models/topology.py`
-  - 外生/内生节点识别、拓扑顺序、上下游查询
-
-### 2.3 常用命令
-
-```bash
-# 训练（两阶段）
-python flowScripts/train.py
-
-# 单步测试（默认测试集）
-python flowScripts/test.py
-
-# 可视化（默认 16 个节点）
-python flowScripts/visualize.py
-```
-
-## 3. 内生递归多步评估（Flow Evaluation）
-
-该部分用于验证“内生节点递归预测能力”。
-
-协议：
-
-1. 以真实历史窗口作为输入
-2. 在一个 block 内递归预测 `steps` 步
-3. 外生节点每步使用真值强制输入
-4. 内生节点使用模型递归预测值
-5. block 结束后重置为真实数据再开始下一个 block
-
-命令：
-
-```bash
-# 输出每步误差（CSV + 曲线图）
-python flowEvaluation/multi_step_evaluate.py --steps 6
-
-# 输出内生节点递归可视化
-python flowEvaluation/visualize_endogenous.py --steps 6 --max-nodes 16
-```
-
-输出：
-
-- `flowEvaluation/results/recursive_endo_metrics.csv`
-- `flowEvaluation/results/recursive_endo_metrics.png`
-- `flowEvaluation/results/endogenous_recursive_visualization.png`
-
-## 4. 充电预测（Charge）
-
-### 4.1 数据准备流程
-
-#### 步骤 A：站点对齐
-
-将 `data/charge/charge.csv` 中不在 canonical 节点集合内的 `node_id` 过滤掉（原地覆盖，可选备份）：
-
-```bash
-python chargePrediction/prepare_charge_data.py
-```
-
-#### 步骤 B：构建充电训练/测试数据
-
-从流量数据（优先模型预测流量）构建最终训练文件：
-
-```bash
-python chargePrediction/prepare_charge_dataset.py
-```
-
-默认输出：
-
-- `data/charge/train.csv`
-- `data/charge/test.csv`
-
-最终字段：
-
-- `hour_code`
-- `week_code`
-- `station_id`
-- `node_id`
-- `charge_flow_ratio`（充电人数 / 交通流）
-- `charge_power`（平均功率 = 总功率 / 充电人数）
-
-### 4.2 站点级模型训练
-
-每个站点（`node_id`）训练两个模型（仅使用训练数据，不再拆分验证集）：
-
-1. 比率模型：Beta 分布，学习 `alpha`、`beta`
-2. 平均功率模型：LogNormal 分布，学习 `mu`、`sigma`
-
-特征为周/日编码的一倍与二倍频傅里叶基。
-
-```bash
-python chargePrediction/train_station_models.py
-```
-
-输出：
-
-- `chargePrediction/models/ratio/<node_id>.pt`
-- `chargePrediction/models/power/<node_id>.pt`
-- `chargePrediction/models/training_summary.csv`
-- `chargePrediction/models/training_report.json`
-
-### 4.3 端到端总功率测试（最终指标）
-
-测试集定义：按时间排序后取最后 20%（8:2 切分中的后 2）。
-
-端到端链路：
-
-1. 先用流量模型预测 `pred_gate_flow`
-2. 用 Beta 模型预测 `pred_ratio`
-3. 用 LogNormal 模型预测 `pred_avg_power`
-4. 组合得到总功率预测：
-   - `pred_total_power = pred_gate_flow * pred_ratio * pred_avg_power`
-
-评估目标是**总功率**（不再除以充电人数），输出 MAE / RMSE。
-
-```bash
-python chargePrediction/test_station_models.py
-```
-
-输出：
-
-- `chargePrediction/models/e2e_test_detail.csv`
-- `chargePrediction/models/e2e_test_node_metrics.csv`
-- `chargePrediction/models/e2e_test_report.json`
-
-### 4.4 端到端可视化
-
-```bash
-python chargePrediction/visualize_total_power.py
-```
-
-输出：
-
-- `chargePrediction/models/e2e_total_power_visualization.png`
-
-## 5. 主要配置
-
-配置文件：`flowConfig/config.py`
-
-重点配置项：
-
-- 数据与设备：`DATA_DIR`, `MODEL_DIR`, `SEQ_LEN`, `PRED_LEN`, `DEVICE`
-- 节点对齐：`NODE_ALIGNMENT`
-- Stage-1 外生训练：`EXOGENOUS_TRAIN`
-- Stage-2 内生训练：`ENDOGENOUS_TRAIN`
-- 混合采样：`SCHEDULED_SAMPLING`
-- 非负约束：`OUTPUT_CONSTRAINTS`
-- 内生高斯补偿：`ENDOGENOUS_GAUSSIAN`
-
-## 6. 环境依赖
-
-建议 Python 3.10+，核心依赖：
-
-- `torch`
-- `numpy`
-- `pandas`
-- `matplotlib`
-
-可按需安装：
+- Python >= 3.10
+- 主要依赖：`torch`, `numpy`, `pandas`, `matplotlib`
 
 ```bash
 pip install torch numpy pandas matplotlib
 ```
 
-## 7. 一键复现实验顺序（建议）
+### 2) 运行入口
+
+所有脚本默认在仓库根目录执行，例如：
 
 ```bash
-# 1) 训练交通流模型
+python flowScripts/train.py
+```
+
+## 三、数据格式要求
+
+### 1) Flow 数据 (`data/flow/train.csv`, `data/flow/test.csv`)
+
+必需列：
+
+- `date`
+- `slice_start`
+- `hour_code`
+- `week_code`
+- `station_id`
+- `nev_flow`
+
+### 2) 拓扑数据 (`data/flow/adj.csv`)
+
+- 行索引与列名均为节点 ID
+- `value > 0` 表示有方向边（source -> target）
+
+### 3) Charge 原始数据 (`data/charge/charge.csv`)
+
+端到端测试最少需要这些列：
+
+- `node_id`
+- `date`
+- `hour_code`
+- `week_code`
+- `nev_flow`（充电车流）
+- `power`（总充电功率）
+
+若不存在 `station_id`，脚本会自动用 `node_id` 补齐。
+
+### 4) Charge 建模最终文件 (`data/charge/train.csv`, `data/charge/test.csv`)
+
+由 `prepare_charge_dataset.py` 生成，字段固定为：
+
+- `hour_code`
+- `week_code`
+- `station_id`
+- `node_id`
+- `charge_flow_ratio` = `charge_nev_flow / gate_nev_flow`
+- `charge_power` = `charge_power_total / charge_nev_flow`（平均功率）
+
+## 四、核心模块说明
+
+### 1) Flow 阶段模型
+
+- 外生节点：`MultiNodeLSTMPredictor`
+- 内生节点：
+  - `FourierAllocation` 负责上游出边归一化分配
+  - `BayesianPropagation` 负责时序传播概率
+- 主模型：`FlowPredictor`
+  - 支持 `scheduled sampling`
+  - 支持内生节点高斯补偿 `ENDOGENOUS_GAUSSIAN`
+  - 可选物理空间非负约束 `OUTPUT_CONSTRAINTS.physical_non_negative`
+
+### 2) 节点对齐策略
+
+默认策略在 `flowConfig/config.py`：
+
+- `NODE_ALIGNMENT.enabled = True`
+- canonical 节点集合 = `adj ∩ train ∩ test`
+
+Flow 训练、评估、Charge 对齐都复用该策略，避免节点集合不一致。
+
+### 3) Charge 阶段模型
+
+对每个 `node_id` 独立训练两类模型：
+
+1. 比率模型：Beta 分布，预测 `charge_flow_ratio`
+2. 平均功率模型：LogNormal 分布，预测 `charge_power`
+
+特征为 `hour_code`、`week_code` 的一/二阶傅里叶基。
+
+## 五、推荐运行顺序（完整复现）
+
+```bash
+# 0) 可选：先过滤 charge.csv 到 canonical 节点（默认会备份并原地覆盖）
+python chargePrediction/prepare_charge_data.py
+
+# 1) 训练 flow 两阶段模型
 python flowScripts/train.py
 
-# 2) 测试与可视化交通流
+# 2) flow 单步测试与可视化
 python flowScripts/test.py
 python flowScripts/visualize.py
-python flowEvaluation/multi_step_evaluate.py --steps 6
-python flowEvaluation/visualize_endogenous.py --steps 6
 
-# 3) 充电数据准备
-python chargePrediction/prepare_charge_data.py
+# 3) flow 内生递归多步评估
+python flowEvaluation/multi_step_evaluate.py --steps 6
+python flowEvaluation/visualize_endogenous.py --steps 6 --max-nodes 16
+
+# 4) 生成 charge 建模数据（默认优先使用 flow 模型预测流量）
 python chargePrediction/prepare_charge_dataset.py
 
-# 4) 训练充电模型
+# 5) 训练站点级 charge 模型
 python chargePrediction/train_station_models.py
 
-# 5) 端到端总功率测试与可视化
+# 6) 端到端总功率评估 + 可视化
 python chargePrediction/test_station_models.py
 python chargePrediction/visualize_total_power.py
 ```
 
-## 8. 备注
+## 六、主要输出文件
 
-- 示例数据仅用于代码连通性验证，真实数据需在服务器环境运行。
-- 若本地缺少真实 checkpoint 或完整数据，脚本可能无法得到有效指标，但不影响代码结构与流程正确性。
+### 1) Flow 阶段
+
+- `models/exogenous/*.pt`：Stage-1 外生节点 checkpoint
+- `models/best_model.pt`：Stage-2 主模型 checkpoint
+- `models/visualization.png`：flow 预测可视化
+
+### 2) Flow 递归评估
+
+- `flowEvaluation/results/recursive_endo_metrics.csv`
+- `flowEvaluation/results/recursive_endo_metrics.png`
+- `flowEvaluation/results/endogenous_recursive_visualization.png`
+
+### 3) Charge 数据准备
+
+- `chargePrediction/data/charge_model_all.csv`
+- `chargePrediction/data/charge_model_train.csv`
+- `chargePrediction/data/charge_model_test.csv`
+- `chargePrediction/data/dataset_report.json`
+- `data/charge/train.csv`（最终训练输入）
+- `data/charge/test.csv`（最终测试输入）
+
+### 4) Charge 训练/评估
+
+- `chargePrediction/models/ratio/<node_id>.pt`
+- `chargePrediction/models/power/<node_id>.pt`
+- `chargePrediction/models/training_summary.csv`
+- `chargePrediction/models/training_report.json`
+- `chargePrediction/models/e2e_test_detail.csv`
+- `chargePrediction/models/e2e_test_node_metrics.csv`
+- `chargePrediction/models/e2e_test_report.json`
+- `chargePrediction/models/e2e_total_power_visualization.png`
+
+## 七、常用参数
+
+### 1) `flowEvaluation/multi_step_evaluate.py`
+
+- `--steps`：每个 block 递归预测步数（默认 `6`）
+- `--output-dir`：指标输出目录
+
+### 2) `chargePrediction/prepare_charge_dataset.py`
+
+- `--use-canonical-filter`：是否按 canonical 节点过滤 charge 数据
+- `--no-model-pred`：禁用 flow 模型预测流量（退回真值）
+- `--strict-model-pred`：预测流量失败时直接报错
+- `--final-train-path` / `--final-test-path`：最终导出路径
+
+### 3) `chargePrediction/train_station_models.py`
+
+- `--ratio-epochs`, `--power-epochs`
+- `--ratio-lr`, `--power-lr`
+- `--min-samples`：每站点最少样本数
+
+### 4) `chargePrediction/test_station_models.py`
+
+- `--test-ratio`：末尾时间切片比例（默认 `0.2`）
+- `--station-model-dir`：站点模型目录
+- `--use-canonical-filter`
+
+## 八、关键配置（`flowConfig/config.py`）
+
+- 数据与设备：`DATA_DIR`, `MODEL_DIR`, `SEQ_LEN`, `PRED_LEN`, `DEVICE`
+- 节点对齐：`NODE_ALIGNMENT`
+- Stage-1：`EXOGENOUS_TRAIN`
+- Stage-2：`ENDOGENOUS_TRAIN`
+- 训练策略：`SCHEDULED_SAMPLING`
+- 输出约束：`OUTPUT_CONSTRAINTS`
+- 内生补偿：`ENDOGENOUS_GAUSSIAN`
+
+## 九、常见问题
+
+1. 报错 `Checkpoint not found: models/best_model.pt`
+   先运行 `python flowScripts/train.py` 生成 Stage-2 checkpoint。
+
+2. 报错 `No canonical nodes found` 或节点缺失
+   检查 `adj.csv`、`train.csv`、`test.csv` 三者节点交集是否为空，必要时关闭/调整 `NODE_ALIGNMENT`。
+
+3. 端到端评估节点大量被跳过
+   一般是某些站点缺少 `ratio/power` checkpoint，先确认 `train_station_models.py` 的 `--min-samples` 设置与训练数据覆盖。
+
+4. 指标异常或样本很少
+   重点检查 `charge.csv` 的 `nev_flow/power` 是否存在大量零值或缺失值，以及时间列是否可正确解析。
